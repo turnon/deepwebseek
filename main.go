@@ -1,7 +1,3 @@
-// deepseek —— 通过 OpenAI 官方 SDK（openai-go v3）的 Responses 接口调用 DeepSeek 的 CLI 工具。
-//
-// 使用官方 SDK 的 client.Responses.New / NewStreaming 接口，
-// tools 中内置 web_search（{"type": "web_search"}）。
 package main
 
 import (
@@ -212,21 +208,25 @@ func run(o options) error {
 	return printOutput(ctx, client, params)
 }
 
-// ---------- 流式输出 ----------
-
+// streamOutput 流式输出
 func streamOutput(ctx context.Context, client openai.Client, params responses.ResponseNewParams) error {
 	stream := client.Responses.NewStreaming(ctx, params)
+	delta := ""
 	for stream.Next() {
 		ev := stream.Current()
 		switch ev.Type {
 		case "response.output_text.delta":
-			fmt.Print(ev.Delta) // 流式文本，不换行
-		case "response.web_search_call.searching":
-			fmt.Fprintln(os.Stderr, "🔍 web_search: 搜索中...")
+			fmt.Print(ev.Delta)
+			delta = ev.Delta
 		case "response.web_search_call.in_progress":
-			fmt.Fprintln(os.Stderr, "🔍 web_search: 进行中...")
+			if delta != "" && !strings.HasSuffix(delta, "\n") {
+				fmt.Println()
+			}
+			fmt.Fprintf(os.Stderr, gray("web searching [%d]\n"), ev.OutputIndex)
+		case "response.web_search_call.searching":
+			fmt.Fprintf(os.Stderr, gray("web searching [%d]\n"), ev.OutputIndex)
 		case "response.web_search_call.completed":
-			fmt.Fprintln(os.Stderr, "🔍 web_search: 完成")
+			fmt.Fprintf(os.Stderr, gray("web searched! [%d]\n"), ev.OutputIndex)
 		case "error":
 			if msg := ev.AsError().Message; msg != "" {
 				return errors.New(msg)
@@ -242,8 +242,12 @@ func streamOutput(ctx context.Context, client openai.Client, params responses.Re
 	return nil
 }
 
-// ---------- 非流式输出 ----------
+// gray 将 s 渲染为灰色前景色文本（ANSI 转义序列）。
+func gray(s string) string {
+	return "\x1b[90m" + s + "\x1b[0m"
+}
 
+// printOutput 非流式输出
 func printOutput(ctx context.Context, client openai.Client, params responses.ResponseNewParams) error {
 	resp, err := client.Responses.New(ctx, params)
 	if err != nil {
