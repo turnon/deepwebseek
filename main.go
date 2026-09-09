@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -19,33 +22,46 @@ const (
 	defaultBaseURL = "https://api.deepseek.com"
 	defaultModel   = "deepseek-v4-flash"
 
-	usage = `deepseek —— 通过 OpenAI Responses API 调用 DeepSeek（tools 内置 web_search）
+	usage = `deepwebseek —— 通过 OpenAI Responses API 调用 DeepSeek（tools 内置 web_search）
 
 用法:
-  deepseek [选项] [提示词...]
-  echo "提示词" | deepseek [选项]
+  deepwebseek [选项] [提示词...]
+  echo "提示词" | deepwebseek [选项]
 
 提示词:
   优先读取标准输入（管道传入）；否则使用命令行参数拼接。
   选项可以出现在参数中的任意位置。
 
 选项:
+  --id <id>          选择配置文件中的模型档案（默认 $DEEPWEBSEEK_ID 或配置文件 default_id）
   --json             请求 JSON 对象输出（response_format 为 {"type":"json_object"}）
   --stream           流式输出
-  --model <name>     模型名（默认 $DEEPSEEK_MODEL 或 deepseek-v4-flash）
-  --base-url <url>   API 基础地址（默认 $DEEPSEEK_BASE_URL 或 https://api.deepseek.com）
+  --model <name>     模型名（默认 $DEEPWEBSEEK_MODEL 或 deepseek-v4-flash）
+  --base-url <url>   API 基础地址（默认 $DEEPWEBSEEK_BASE_URL 或 https://api.deepseek.com）
   --max-tokens <n>   最大输出 token 数
   -h, --help         显示本帮助
 
 环境变量:
-  DEEPSEEK_API_KEY   必填，DeepSeek API Key
-  DEEPSEEK_MODEL     可选，默认模型
-  DEEPSEEK_BASE_URL  可选，API 基础地址
+  DEEPWEBSEEK_API_KEY   可选（也可写在 ~/.deepwebseek.json），DeepSeek API Key
+  DEEPWEBSEEK_MODEL     可选，默认模型
+  DEEPWEBSEEK_BASE_URL  可选，API 基础地址
+  DEEPWEBSEEK_ID        可选，默认模型档案 id
 
 示例:
-  deepseek "今天北京天气怎么样？" --stream
-  echo "总结一下 OpenAI Responses API 与 web_search" | deepseek --stream
-  echo '{"问题":"2+2 等于几？"}' | deepseek --json
+  deepwebseek "今天北京天气怎么样？" --stream
+  echo "总结一下 OpenAI Responses API 与 web_search" | deepwebseek --stream
+  echo '{"问题":"2+2 等于几？"}' | deepwebseek --json
+
+配置文件 ~/.deepwebseek.json（可选，JSON，支持多个模型档案）:
+  {"default_id": "deepseek",
+   "models": [
+     {"id": "deepseek", "model": "deepseek-v4-flash",
+      "base_url": "https://api.deepseek.com", "api_key": "sk-..."}
+   ]}
+
+优先级（从低到高）:
+  默认值 < ~/.deepwebseek.json（按 id 选中的档案） < 环境变量 < 命令行参数
+  档案选择：--id > $DEEPWEBSEEK_ID > 配置文件 default_id
 `
 )
 
@@ -77,7 +93,7 @@ func main() {
 		os.Exit(2)
 	}
 	if opts.apiKey == "" {
-		fmt.Fprintln(os.Stderr, "deepseek: 缺少 API Key，请设置环境变量 DEEPSEEK_API_KEY")
+		fmt.Fprintln(os.Stderr, "deepseek: 缺少 API Key，请设置环境变量 DEEPWEBSEEK_API_KEY 或在 ~/.deepwebseek.json 中配置 api_key")
 		os.Exit(2)
 	}
 	if err := run(opts); err != nil {
@@ -87,11 +103,26 @@ func main() {
 }
 
 // parseArgs 手工解析参数，允许选项出现在提示词前后任意位置。
+// 优先级（从低到高）：默认值 < 配置文件 ~/.deepwebseek.json（按 id 选中的档案）
+// < 环境变量 < 命令行参数；档案选择：--id > $DEEPWEBSEEK_ID > 配置文件 default_id。
 func parseArgs(args []string) (options, error) {
 	o := options{
-		model:   envOr("DEEPSEEK_MODEL", defaultModel),
-		baseURL: envOr("DEEPSEEK_BASE_URL", defaultBaseURL),
-		apiKey:  os.Getenv("DEEPSEEK_API_KEY"),
+		model:   defaultModel,
+		baseURL: defaultBaseURL,
+	}
+
+	// 1. 配置文件 ~/.deepwebseek.json
+	cfg, err := loadConfigFile()
+	if err != nil {
+		return o, err
+	}
+
+	// 2. 先解析命令行，记录哪些选项被显式设置（用于最后覆盖）。
+	var cli struct {
+		id                                 string
+		model, baseURL                     string
+		maxTokens                          int
+		modelSet, baseURLSet, maxTokensSet bool
 	}
 	var promptWords []string
 	for i := 0; i < len(args); i++ {
@@ -103,18 +134,24 @@ func parseArgs(args []string) (options, error) {
 			o.stream = true
 		case a == "--help" || a == "-h":
 			o.showHelp = true
+		case a == "--id" || strings.HasPrefix(a, "--id="):
+			v, err := flagValue(args, &i, a, "--id")
+			if err != nil {
+				return o, err
+			}
+			cli.id = v
 		case a == "--model" || strings.HasPrefix(a, "--model="):
 			v, err := flagValue(args, &i, a, "--model")
 			if err != nil {
 				return o, err
 			}
-			o.model = v
+			cli.model, cli.modelSet = v, true
 		case a == "--base-url" || strings.HasPrefix(a, "--base-url="):
 			v, err := flagValue(args, &i, a, "--base-url")
 			if err != nil {
 				return o, err
 			}
-			o.baseURL = v
+			cli.baseURL, cli.baseURLSet = v, true
 		case a == "--max-tokens" || strings.HasPrefix(a, "--max-tokens="):
 			v, err := flagValue(args, &i, a, "--max-tokens")
 			if err != nil {
@@ -124,12 +161,40 @@ func parseArgs(args []string) (options, error) {
 			if err != nil {
 				return o, fmt.Errorf("--max-tokens 需要整数，得到 %q", v)
 			}
-			o.maxTokens = n
+			cli.maxTokens, cli.maxTokensSet = n, true
 		case strings.HasPrefix(a, "-") && a != "-":
 			return o, fmt.Errorf("未知参数 %q（可用 --help 查看用法）", a)
 		default:
 			promptWords = append(promptWords, a)
 		}
+	}
+
+	// 3. 选择并应用模型档案：--id > $DEEPWEBSEEK_ID > 配置文件 default_id。
+	id := firstNonEmpty(cli.id, os.Getenv("DEEPWEBSEEK_ID"), cfg.DefaultID)
+	if err := cfg.applyProfile(&o, id); err != nil {
+		return o, err
+	}
+
+	// 4. 环境变量覆盖
+	if v := os.Getenv("DEEPWEBSEEK_MODEL"); v != "" {
+		o.model = v
+	}
+	if v := os.Getenv("DEEPWEBSEEK_BASE_URL"); v != "" {
+		o.baseURL = v
+	}
+	if v := os.Getenv("DEEPWEBSEEK_API_KEY"); v != "" {
+		o.apiKey = v
+	}
+
+	// 5. 命令行参数覆盖（仅覆盖被显式设置的项）
+	if cli.modelSet {
+		o.model = cli.model
+	}
+	if cli.baseURLSet {
+		o.baseURL = cli.baseURL
+	}
+	if cli.maxTokensSet {
+		o.maxTokens = cli.maxTokens
 	}
 
 	// 提示词优先级：有标准输入（管道）则读 stdin，否则用命令行参数。
@@ -143,6 +208,73 @@ func parseArgs(args []string) (options, error) {
 		o.prompt = strings.Join(promptWords, " ")
 	}
 	return o, nil
+}
+
+// modelProfile 是配置文件中一个模型档案。
+type modelProfile struct {
+	ID      string `json:"id"`
+	Model   string `json:"model"`
+	BaseURL string `json:"base_url"`
+	APIKey  string `json:"api_key"`
+}
+
+// configFile 是 ~/.deepwebseek.json 的结构。
+type configFile struct {
+	DefaultID string         `json:"default_id"`
+	Models    []modelProfile `json:"models"`
+}
+
+// loadConfigFile 读取 ~/.deepwebseek.json，文件不存在则返回零值。
+func loadConfigFile() (configFile, error) {
+	var cfg configFile
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return cfg, nil // 无法定位 home 时跳过配置文件
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".deepwebseek.json"))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return cfg, nil
+		}
+		return cfg, fmt.Errorf("读取配置文件 ~/.deepwebseek.json 失败: %w", err)
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("解析配置文件 ~/.deepwebseek.json 失败: %w", err)
+	}
+	return cfg, nil
+}
+
+// applyProfile 将 id 对应的模型档案应用到 o，零值字段不覆盖；id 为空时不做任何事。
+func (c configFile) applyProfile(o *options, id string) error {
+	if id == "" {
+		return nil
+	}
+	for _, m := range c.Models {
+		if m.ID != id {
+			continue
+		}
+		if m.Model != "" {
+			o.model = m.Model
+		}
+		if m.BaseURL != "" {
+			o.baseURL = m.BaseURL
+		}
+		if m.APIKey != "" {
+			o.apiKey = m.APIKey
+		}
+		return nil
+	}
+	return fmt.Errorf("配置文件 ~/.deepwebseek.json 中不存在 id 为 %q 的模型档案", id)
+}
+
+// firstNonEmpty 返回第一个非空字符串。
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // flagValue 支持 "--name=value" 与 "--name value" 两种写法。
@@ -164,13 +296,6 @@ func stdinIsPipe() bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice == 0
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }
 
 // run 用官方 SDK 调用 Responses 接口。
