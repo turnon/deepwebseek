@@ -34,6 +34,7 @@ const (
 
 选项:
   --id <id>          选择配置文件中的模型档案（默认 $DEEPWEBSEEK_ID 或配置文件 default_id）
+  --sys <s>          system prompt：内容本身，或指向的文件路径（默认 $DEEPWEBSEEK_SYS）
   --json             请求 JSON 对象输出（response_format 为 {"type":"json_object"}）
   --stream           流式输出
   --model <name>     模型名（默认 $DEEPWEBSEEK_MODEL 或 deepseek-v4-flash）
@@ -43,12 +44,15 @@ const (
 
 环境变量:
   DEEPWEBSEEK_API_KEY   可选（也可写在 ~/.deepwebseek.json），DeepSeek API Key
+  DEEPWEBSEEK_SYS       可选，system prompt（内容本身或文件路径，可被 --sys 覆盖）
   DEEPWEBSEEK_MODEL     可选，默认模型
   DEEPWEBSEEK_BASE_URL  可选，API 基础地址
   DEEPWEBSEEK_ID        可选，默认模型档案 id
 
 示例:
   deepwebseek "今天北京天气怎么样？" --stream
+  deepwebseek "总结这篇文章" --sys "你是资深编辑，输出中文"
+  deepwebseek "审查这段代码" --sys ./prompts/code-review.md
   echo "总结一下 OpenAI Responses API 与 web_search" | deepwebseek --stream
   echo '{"问题":"2+2 等于几？"}' | deepwebseek --json
 
@@ -74,6 +78,7 @@ type options struct {
 	baseURL   string
 	apiKey    string
 	maxTokens int
+	sysPrompt string // --sys / $DEEPWEBSEEK_SYS：内容或文件路径
 	showHelp  bool
 }
 
@@ -119,10 +124,11 @@ func parseArgs(args []string) (options, error) {
 
 	// 2. 先解析命令行，记录哪些选项被显式设置（用于最后覆盖）。
 	var cli struct {
-		id                                 string
-		model, baseURL                     string
-		maxTokens                          int
-		modelSet, baseURLSet, maxTokensSet bool
+		id                           string
+		model, baseURL, sys          string
+		maxTokens                    int
+		modelSet, baseURLSet, sysSet bool
+		maxTokensSet                 bool
 	}
 	var promptWords []string
 	for i := 0; i < len(args); i++ {
@@ -140,6 +146,12 @@ func parseArgs(args []string) (options, error) {
 				return o, err
 			}
 			cli.id = v
+		case a == "--sys" || strings.HasPrefix(a, "--sys="):
+			v, err := flagValue(args, &i, a, "--sys")
+			if err != nil {
+				return o, err
+			}
+			cli.sys, cli.sysSet = v, true
 		case a == "--model" || strings.HasPrefix(a, "--model="):
 			v, err := flagValue(args, &i, a, "--model")
 			if err != nil {
@@ -185,6 +197,9 @@ func parseArgs(args []string) (options, error) {
 	if v := os.Getenv("DEEPWEBSEEK_API_KEY"); v != "" {
 		o.apiKey = v
 	}
+	if v := os.Getenv("DEEPWEBSEEK_SYS"); v != "" {
+		o.sysPrompt = v
+	}
 
 	// 5. 命令行参数覆盖（仅覆盖被显式设置的项）
 	if cli.modelSet {
@@ -196,6 +211,16 @@ func parseArgs(args []string) (options, error) {
 	if cli.maxTokensSet {
 		o.maxTokens = cli.maxTokens
 	}
+	if cli.sysSet {
+		o.sysPrompt = cli.sys
+	}
+
+	// system prompt：若 --sys / $DEEPWEBSEEK_SYS 指向存在的文件则读取其内容，否则视为字面内容。
+	sp, err := resolveSysPrompt(o.sysPrompt)
+	if err != nil {
+		return o, err
+	}
+	o.sysPrompt = sp
 
 	// 提示词优先级：有标准输入（管道）则读 stdin，否则用命令行参数。
 	if stdinIsPipe() {
@@ -277,6 +302,22 @@ func firstNonEmpty(vs ...string) string {
 	return ""
 }
 
+// resolveSysPrompt 将 --sys / $DEEPWEBSEEK_SYS 的值解析为 system prompt：
+// 值为空返回空；值是可读取的文件路径则返回文件内容；否则视为字面内容原样返回。
+func resolveSysPrompt(v string) (string, error) {
+	if v == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(v)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return v, nil
+		}
+		return "", fmt.Errorf("读取 system prompt 文件 %q 失败: %w", v, err)
+	}
+	return string(data), nil
+}
+
 // flagValue 支持 "--name=value" 与 "--name value" 两种写法。
 func flagValue(args []string, i *int, arg, name string) (string, error) {
 	if v, ok := strings.CutPrefix(arg, name+"="); ok {
@@ -316,6 +357,9 @@ func run(o options) error {
 		Tools: []responses.ToolUnionParam{
 			responses.ToolParamOfWebSearch(responses.WebSearchToolTypeWebSearch),
 		},
+	}
+	if o.sysPrompt != "" {
+		params.Instructions = openai.String(o.sysPrompt)
 	}
 	if o.jsonMode {
 		// JSON 对象输出：SDK 将其编码为 "text":{"format":{"type":"json_object"}}。
