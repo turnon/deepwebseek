@@ -85,7 +85,7 @@ type options struct {
 func main() {
 	opts, err := parseArgs(os.Args[1:])
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "deepseek:", err)
+		fmt.Fprintln(os.Stderr, "deepwebseek:", err)
 		os.Exit(2)
 	}
 	if opts.showHelp {
@@ -93,16 +93,16 @@ func main() {
 		return
 	}
 	if opts.prompt == "" {
-		fmt.Fprintln(os.Stderr, "deepseek: 未提供提示词（通过管道传入 stdin，或使用命令行参数）")
+		fmt.Fprintln(os.Stderr, "deepwebseek: 未提供提示词（通过管道传入 stdin，或使用命令行参数）")
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
 	if opts.apiKey == "" {
-		fmt.Fprintln(os.Stderr, "deepseek: 缺少 API Key，请设置环境变量 DEEPWEBSEEK_API_KEY 或在 ~/.deepwebseek.json 中配置 api_key")
+		fmt.Fprintln(os.Stderr, "deepwebseek: 缺少 API Key，请设置环境变量 DEEPWEBSEEK_API_KEY 或在 ~/.deepwebseek.json 中配置 api_key")
 		os.Exit(2)
 	}
 	if err := run(opts); err != nil {
-		fmt.Fprintln(os.Stderr, "deepseek:", err)
+		fmt.Fprintln(os.Stderr, "deepwebseek:", err)
 		os.Exit(1)
 	}
 }
@@ -372,13 +372,13 @@ func run(o options) error {
 	}
 
 	if o.stream {
-		return streamOutput(ctx, client, params)
+		return o.streamOutput(ctx, client, params)
 	}
-	return printOutput(ctx, client, params)
+	return o.printOutput(ctx, client, params)
 }
 
 // streamOutput 流式输出
-func streamOutput(ctx context.Context, client openai.Client, params responses.ResponseNewParams) error {
+func (o options) streamOutput(ctx context.Context, client openai.Client, params responses.ResponseNewParams) error {
 	stream := client.Responses.NewStreaming(ctx, params)
 	delta := ""
 	for stream.Next() {
@@ -416,8 +416,8 @@ func gray(s string) string {
 	return "\x1b[90m" + s + "\x1b[0m"
 }
 
-// printOutput 非流式输出
-func printOutput(ctx context.Context, client openai.Client, params responses.ResponseNewParams) error {
+// printOutput 非流式输出；--json 模式下先对输出做 Unmarshal/Marshal 规范化。
+func (o options) printOutput(ctx context.Context, client openai.Client, params responses.ResponseNewParams) error {
 	resp, err := client.Responses.New(ctx, params)
 	if err != nil {
 		return wrapAPIError(err)
@@ -425,9 +425,23 @@ func printOutput(ctx context.Context, client openai.Client, params responses.Res
 	text := resp.OutputText()
 	if strings.TrimSpace(text) == "" {
 		// 无输出文本时打印原始响应，方便排查。
-		fmt.Fprintln(os.Stderr, "deepseek: 响应中没有输出文本，原始响应如下：")
+		fmt.Fprintln(os.Stderr, "deepwebseek: 响应中没有输出文本，原始响应如下：")
 		fmt.Fprintln(os.Stderr, truncate(resp.RawJSON(), 2000))
 		return nil
+	}
+	if o.jsonMode {
+		// 先 Unmarshal + Marshal 规范化为紧凑单行 JSON；失败时警告并原样输出。
+		var v any
+		if err := json.Unmarshal([]byte(text), &v); err != nil {
+			fmt.Fprintf(os.Stderr, "deepwebseek: 输出不是合法 JSON，原样打印（%v）\n", err)
+			return nil
+		}
+		if b, err := json.Marshal(v); err != nil {
+			fmt.Fprintf(os.Stderr, "deepwebseek: JSON 序列化失败，原样打印（%v）\n", err)
+			return nil
+		} else {
+			text = string(b)
+		}
 	}
 	fmt.Println(text)
 	return nil
