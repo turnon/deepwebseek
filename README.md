@@ -28,9 +28,11 @@ echo "提示词" | deepwebseek [选项]
 | `--sys <s>` | system prompt：值为内容本身，或指向的文件路径（文件存在则读取其内容）；默认 `$DEEPWEBSEEK_SYS` |
 | `--json` | 请求 JSON 对象输出（SDK 编码为 `"text":{"format":{"type":"json_object"}}`） |
 | `--stream` | 流式输出（`client.Responses.NewStreaming`）；`web_search` 状态打印到 stderr，文本增量输出到 stdout |
-| `--model <name>` | 模型名，默认 `$DEEPWEBSEEK_MODEL` 或 `deepseek-v4-flash` |
+| `--model <name>` | 模型名，默认 `$DEEPWEBSEEK_MODEL` 或 `deepseek-flash` |
 | `--base-url <url>` | API 基础地址，默认 `$DEEPWEBSEEK_BASE_URL` 或 `https://api.deepseek.com` |
 | `--max-tokens <n>` | 最大输出 token 数 |
+| `--reasoning <e>` | 推理强度：`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`（仅对推理模型生效，SDK 编码为 `reasoning.effort`） |
+| `--web-search <m>` | web_search 模式：`none`（不启用，不传 `web_search` 工具）/ `auto`（默认，模型自行决定是否搜索）/ `required`（强制搜索，`tool_choice: "required"`） |
 | `-h, --help` | 显示帮助 |
 
 选项可出现在参数任意位置。
@@ -44,6 +46,7 @@ echo "提示词" | deepwebseek [选项]
 | `DEEPWEBSEEK_MODEL` | 可选，默认模型 |
 | `DEEPWEBSEEK_BASE_URL` | 可选，API 基础地址 |
 | `DEEPWEBSEEK_ID` | 可选，默认模型档案 id |
+| `DEEPWEBSEEK_REASONING` | 可选，推理强度（同 `--reasoning` 取值，可被 `--reasoning` 覆盖） |
 
 ### system prompt 示例
 
@@ -65,7 +68,7 @@ DEEPWEBSEEK_SYS="你是一个简洁的助手" deepwebseek "什么是 Responses A
 ```json
 {"default_id": "deepseek",
  "models": [
-   {"id": "deepseek", "model": "deepseek-v4-flash",
+   {"id": "deepseek", "model": "deepseek-flash",
     "base_url": "https://api.deepseek.com", "api_key": "sk-..."}
  ]}
 ```

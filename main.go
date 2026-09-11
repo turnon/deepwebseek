@@ -14,13 +14,14 @@ import (
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared"
 )
 
 const (
 	defaultBaseURL = "https://api.deepseek.com"
-	defaultModel   = "deepseek-v4-flash"
+	defaultModel   = "deepseek-flash"
 
 	usage = `deepwebseek —— 通过 OpenAI Responses API 调用 DeepSeek（tools 内置 web_search）
 
@@ -37,10 +38,11 @@ const (
   --sys <s>          system prompt：内容本身，或指向的文件路径（默认 $DEEPWEBSEEK_SYS）
   --json             请求 JSON 对象输出（response_format 为 {"type":"json_object"}）
   --stream           流式输出
-  --model <name>     模型名（默认 $DEEPWEBSEEK_MODEL 或 deepseek-v4-flash）
+  --model <name>     模型名（默认 $DEEPWEBSEEK_MODEL 或 deepseek-flash）
   --base-url <url>   API 基础地址（默认 $DEEPWEBSEEK_BASE_URL 或 https://api.deepseek.com）
   --max-tokens <n>   最大输出 token 数
-  -h, --help         显示本帮助
+  --reasoning <e>    推理强度：none/minimal/low/medium/high/xhigh/max（仅对推理模型生效）
+  --web-search <m>   web_search 模式：none（不启用）/ auto（默认，模型自行决定）/ required（必须搜索）
 
 环境变量:
   DEEPWEBSEEK_API_KEY   可选（也可写在 ~/.deepwebseek.json），DeepSeek API Key
@@ -48,6 +50,7 @@ const (
   DEEPWEBSEEK_MODEL     可选，默认模型
   DEEPWEBSEEK_BASE_URL  可选，API 基础地址
   DEEPWEBSEEK_ID        可选，默认模型档案 id
+  DEEPWEBSEEK_REASONING 可选，推理强度（同 --reasoning 取值，可被 --reasoning 覆盖）
 
 示例:
   deepwebseek "今天北京天气怎么样？" --stream
@@ -59,7 +62,7 @@ const (
 配置文件 ~/.deepwebseek.json（可选，JSON，支持多个模型档案）:
   {"default_id": "deepseek",
    "models": [
-     {"id": "deepseek", "model": "deepseek-v4-flash",
+     {"id": "deepseek", "model": "deepseek-flash",
       "base_url": "https://api.deepseek.com", "api_key": "sk-..."}
    ]}
 
@@ -78,7 +81,9 @@ type options struct {
 	baseURL   string
 	apiKey    string
 	maxTokens int
-	sysPrompt string // --sys / $DEEPWEBSEEK_SYS：内容或文件路径
+	sysPrompt string                 // --sys / $DEEPWEBSEEK_SYS：内容或文件路径
+	reasoning shared.ReasoningEffort // 推理强度：none/minimal/low/medium/high/xhigh/max
+	webSearch string                 // --web-search：none/auto/required，空值相当于 auto
 	showHelp  bool
 }
 
@@ -127,8 +132,11 @@ func parseArgs(args []string) (options, error) {
 		id                           string
 		model, baseURL, sys          string
 		maxTokens                    int
+		reasoning                    shared.ReasoningEffort
+		webSearch                    string
 		modelSet, baseURLSet, sysSet bool
-		maxTokensSet                 bool
+		maxTokensSet, reasoningSet   bool
+		webSearchSet                 bool
 	}
 	var promptWords []string
 	for i := 0; i < len(args); i++ {
@@ -174,6 +182,26 @@ func parseArgs(args []string) (options, error) {
 				return o, fmt.Errorf("--max-tokens 需要整数，得到 %q", v)
 			}
 			cli.maxTokens, cli.maxTokensSet = n, true
+		case a == "--reasoning" || strings.HasPrefix(a, "--reasoning="):
+			v, err := flagValue(args, &i, a, "--reasoning")
+			if err != nil {
+				return o, err
+			}
+			cli.reasoning, err = parseReasoning(v)
+			if err != nil {
+				return o, err
+			}
+			cli.reasoningSet = true
+		case a == "--web-search" || strings.HasPrefix(a, "--web-search="):
+			v, err := flagValue(args, &i, a, "--web-search")
+			if err != nil {
+				return o, err
+			}
+			cli.webSearch, err = parseWebSearchMode(v)
+			if err != nil {
+				return o, err
+			}
+			cli.webSearchSet = true
 		case strings.HasPrefix(a, "-") && a != "-":
 			return o, fmt.Errorf("未知参数 %q（可用 --help 查看用法）", a)
 		default:
@@ -200,6 +228,13 @@ func parseArgs(args []string) (options, error) {
 	if v := os.Getenv("DEEPWEBSEEK_SYS"); v != "" {
 		o.sysPrompt = v
 	}
+	if v := os.Getenv("DEEPWEBSEEK_REASONING"); v != "" {
+		e, err := parseReasoning(v)
+		if err != nil {
+			return o, err
+		}
+		o.reasoning = e
+	}
 
 	// 5. 命令行参数覆盖（仅覆盖被显式设置的项）
 	if cli.modelSet {
@@ -213,6 +248,12 @@ func parseArgs(args []string) (options, error) {
 	}
 	if cli.sysSet {
 		o.sysPrompt = cli.sys
+	}
+	if cli.reasoningSet {
+		o.reasoning = cli.reasoning
+	}
+	if cli.webSearchSet {
+		o.webSearch = cli.webSearch
 	}
 
 	// system prompt：若 --sys / $DEEPWEBSEEK_SYS 指向存在的文件则读取其内容，否则视为字面内容。
@@ -318,6 +359,44 @@ func resolveSysPrompt(v string) (string, error) {
 	return string(data), nil
 }
 
+// parseWebSearchMode 解析 --web-search 的取值。
+// 返回 none/auto/required；大小写不敏感，非法取值返回错误。
+func parseWebSearchMode(s string) (string, error) {
+	switch strings.ToLower(s) {
+	case "none":
+		return "none", nil
+	case "auto":
+		return "auto", nil
+	case "required":
+		return "required", nil
+	default:
+		return "", fmt.Errorf("--web-search 取值无效 %q（可选: none auto required）", s)
+	}
+}
+
+// parseReasoning 解析 --reasoning / $DEEPWEBSEEK_REASONING 的推理强度取值。
+// 大小写不敏感，返回 SDK 中的 shared.ReasoningEffort；非法取值返回错误。
+func parseReasoning(s string) (shared.ReasoningEffort, error) {
+	switch strings.ToLower(s) {
+	case "none":
+		return shared.ReasoningEffortNone, nil
+	case "minimal":
+		return shared.ReasoningEffortMinimal, nil
+	case "low":
+		return shared.ReasoningEffortLow, nil
+	case "medium":
+		return shared.ReasoningEffortMedium, nil
+	case "high":
+		return shared.ReasoningEffortHigh, nil
+	case "xhigh":
+		return shared.ReasoningEffortXhigh, nil
+	case "max":
+		return shared.ReasoningEffortMax, nil
+	default:
+		return "", fmt.Errorf("--reasoning 取值无效 %q（可选: none minimal low medium high xhigh max）", s)
+	}
+}
+
 // flagValue 支持 "--name=value" 与 "--name value" 两种写法。
 func flagValue(args []string, i *int, arg, name string) (string, error) {
 	if v, ok := strings.CutPrefix(arg, name+"="); ok {
@@ -353,10 +432,17 @@ func run(o options) error {
 		Input: responses.ResponseNewParamsInputUnion{
 			OfString: openai.String(o.prompt),
 		},
-		// 内置 web_search 工具，线上为 {"type": "web_search"}。
-		Tools: []responses.ToolUnionParam{
-			responses.ToolParamOfWebSearch(responses.WebSearchToolTypeWebSearch),
-		},
+	}
+	// 内置 web_search 工具，线上为 {"type": "web_search"}；--web-search none 时不附加。
+	if o.webSearch != "none" {
+		params.Tools = append(params.Tools,
+			responses.ToolParamOfWebSearch(responses.WebSearchToolTypeWebSearch))
+	}
+	// --web-search required：强制模型调用 web_search（tool_choice: "required"）。
+	if o.webSearch == "required" {
+		params.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
+			OfToolChoiceMode: param.NewOpt(responses.ToolChoiceOptionsRequired),
+		}
 	}
 	if o.sysPrompt != "" {
 		params.Instructions = openai.String(o.sysPrompt)
@@ -370,6 +456,9 @@ func run(o options) error {
 	if o.maxTokens > 0 {
 		params.MaxOutputTokens = openai.Int(int64(o.maxTokens))
 	}
+	if o.reasoning != "" {
+		params.Reasoning.Effort = o.reasoning
+	}
 
 	if o.stream {
 		return o.streamOutput(ctx, client, params)
@@ -381,13 +470,28 @@ func run(o options) error {
 func (o options) streamOutput(ctx context.Context, client openai.Client, params responses.ResponseNewParams) error {
 	stream := client.Responses.NewStreaming(ctx, params)
 	delta := ""
+	inReasoning := false // 是否正在输出思考过程
 	for stream.Next() {
 		ev := stream.Current()
 		switch ev.Type {
+		case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+			// 思考过程走 stderr 并置灰，不污染 stdout 的正文输出
+			fmt.Fprint(os.Stderr, gray(ev.Delta))
+			inReasoning = true
 		case "response.output_text.delta":
+			if inReasoning {
+				// 思考结束、正文开始，补换行 + 分隔线
+				fmt.Fprintln(os.Stderr)
+				fmt.Fprintln(os.Stderr, gray("---"))
+				inReasoning = false
+			}
 			fmt.Print(ev.Delta)
 			delta = ev.Delta
 		case "response.web_search_call.in_progress":
+			if inReasoning {
+				fmt.Fprintln(os.Stderr)
+				inReasoning = false
+			}
 			if delta != "" && !strings.HasSuffix(delta, "\n") {
 				fmt.Println()
 			}
