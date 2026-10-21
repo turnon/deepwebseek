@@ -13,12 +13,15 @@ go build -o deepwebseek .
 ```text
 deepwebseek [选项] [提示词...]
 echo "提示词" | deepwebseek [选项]
+deepwebseek --prompts prompts.txt
+deepwebseek --prompts=/path/to/prompts.txt --prompts-parallel=4
 ```
 
 提示词优先级：
 
-1. **标准输入**（管道/重定向传入），例如 `echo "..." | deepwebseek`
-2. 否则使用**命令行参数**拼接
+1. `--prompts <file>`：**逐行流式读取**文件，**每行一个提示词**，边读边发送
+2. 否则使用**标准输入**（管道/重定向传入），例如 `echo "..." | deepwebseek`
+3. 否则使用**命令行参数**拼接
 
 ### 选项
 
@@ -27,7 +30,9 @@ echo "提示词" | deepwebseek [选项]
 | `--id <id>` | 选择配置文件 `~/.deepwebseek.json` 中的模型档案（默认 `$DEEPWEBSEEK_ID` 或配置文件 `default_id`） |
 | `--sys <s>` | system prompt：值为内容本身，或指向的文件路径（文件存在则读取其内容）；默认 `$DEEPWEBSEEK_SYS` |
 | `--json` | 请求 JSON 对象输出（SDK 编码为 `"text":{"format":{"type":"json_object"}}`） |
-| `--stream` | 流式输出（`client.Responses.NewStreaming`）；`web_search` 状态打印到 stderr，文本增量输出到 stdout |
+| `--stream` | 流式输出（`client.Responses.NewStreaming`）；`web_search` 状态打印到 stderr，文本增量输出到 stdout。仅用于单条提示词，`--prompts` 批量模式不使用 |
+| `--prompts <file>` | 逐行读取提示词文件，每行一个，每个提示词单独发送（文件不会一次性载入内存） |
+| `--prompts-parallel <n>` | 并发发送 `--prompts` 中请求的数量，默认 `1`（顺序发送） |
 | `--model <name>` | 模型名，默认 `$DEEPWEBSEEK_MODEL` 或 `deepseek-flash` |
 | `--base-url <url>` | API 基础地址，默认 `$DEEPWEBSEEK_BASE_URL` 或 `https://api.deepseek.com` |
 | `--max-tokens <n>` | 最大输出 token 数 |
@@ -66,11 +71,17 @@ DEEPWEBSEEK_SYS="你是一个简洁的助手" deepwebseek "什么是 Responses A
 `~/.deepwebseek.json`（可选，JSON，支持多个模型档案）：
 
 ```json
-{"default_id": "deepseek",
- "models": [
-   {"id": "deepseek", "model": "deepseek-flash",
-    "base_url": "https://api.deepseek.com", "api_key": "sk-..."}
- ]}
+{
+  "default_id": "deepseek",
+  "models": [
+    {
+      "id": "deepseek",
+      "model": "deepseek-flash",
+      "base_url": "https://api.deepseek.com",
+      "api_key": "sk-..."
+    }
+  ]
+}
 ```
 
 优先级（从低到高）：默认值 < 配置文件（按 id 选中的档案） < 环境变量 < 命令行参数。

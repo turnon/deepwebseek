@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -23,6 +25,9 @@ const (
 	defaultBaseURL = "https://api.deepseek.com"
 	defaultModel   = "deepseek-flash"
 
+	// 单行提示词的上限；bufio.Scanner 需要显式设置最大 token 大小。
+	maxPromptLineSize = 16 << 20 // 16 MiB
+
 	usage = `deepwebseek —— 通过 OpenAI Responses API 调用 DeepSeek（tools 内置 web_search）
 
 用法:
@@ -30,14 +35,18 @@ const (
   echo "提示词" | deepwebseek [选项]
 
 提示词:
-  优先读取标准输入（管道传入）；否则使用命令行参数拼接。
+  使用 --prompts 时，文件中的每一行都是一个独立的提示词；
+  否则优先读取标准输入（管道传入），再否则使用命令行参数拼接。
   选项可以出现在参数中的任意位置。
 
 选项:
   --id <id>          选择配置文件中的模型档案（默认 $DEEPWEBSEEK_ID 或配置文件 default_id）
   --sys <s>          system prompt：内容本身，或指向的文件路径（默认 $DEEPWEBSEEK_SYS）
   --json             请求 JSON 对象输出（response_format 为 {"type":"json_object"}）
-  --stream           流式输出
+  --stream           流式输出（仅单条提示词；--prompts 批量模式不使用）
+  --prompts <file>   从文件逐行读取提示词，每行一个
+  --prompts-parallel <n>
+                     并发发送 --prompts 中请求的数量（默认 1）
   --model <name>     模型名（默认 $DEEPWEBSEEK_MODEL 或 deepseek-flash）
   --base-url <url>   API 基础地址（默认 $DEEPWEBSEEK_BASE_URL 或 https://api.deepseek.com）
   --max-tokens <n>   最大输出 token 数
@@ -56,6 +65,7 @@ const (
   deepwebseek "今天北京天气怎么样？" --stream
   deepwebseek "总结这篇文章" --sys "你是资深编辑，输出中文"
   deepwebseek "审查这段代码" --sys ./prompts/code-review.md
+  deepwebseek --prompts ./prompts.txt --prompts-parallel 4
   echo "总结一下 OpenAI Responses API 与 web_search" | deepwebseek --stream
   echo '{"问题":"2+2 等于几？"}' | deepwebseek --json
 
@@ -74,17 +84,19 @@ const (
 
 // options 是命令行解析结果。
 type options struct {
-	prompt    string // 提示词
-	jsonMode  bool   // --json：JSON 对象输出
-	stream    bool   // --stream：流式输出
-	model     string
-	baseURL   string
-	apiKey    string
-	maxTokens int
-	sysPrompt string                 // --sys / $DEEPWEBSEEK_SYS：内容或文件路径
-	reasoning shared.ReasoningEffort // 推理强度：none/minimal/low/medium/high/xhigh/max
-	webSearch string                 // --web-search：none/auto/required，空值相当于 auto
-	showHelp  bool
+	prompt          string // 提示词
+	promptsFile     string // --prompts：提示词文件路径（逐行读取）
+	promptsParallel int    // --prompts-parallel：并发请求数
+	jsonMode        bool   // --json：JSON 对象输出
+	stream          bool   // --stream：流式输出
+	model           string
+	baseURL         string
+	apiKey          string
+	maxTokens       int
+	sysPrompt       string                 // --sys / $DEEPWEBSEEK_SYS：内容或文件路径
+	reasoning       shared.ReasoningEffort // 推理强度：none/minimal/low/medium/high/xhigh/max
+	webSearch       string                 // --web-search：none/auto/required，空值相当于 auto
+	showHelp        bool
 }
 
 func main() {
@@ -97,8 +109,8 @@ func main() {
 		fmt.Print(usage)
 		return
 	}
-	if opts.prompt == "" {
-		fmt.Fprintln(os.Stderr, "deepwebseek: 未提供提示词（通过管道传入 stdin，或使用命令行参数）")
+	if opts.promptsFile == "" && opts.prompt == "" {
+		fmt.Fprintln(os.Stderr, "deepwebseek: 未提供提示词（通过管道传入 stdin、使用命令行参数，或使用 --prompts 指定文件）")
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
@@ -117,8 +129,9 @@ func main() {
 // < 环境变量 < 命令行参数；档案选择：--id > $DEEPWEBSEEK_ID > 配置文件 default_id。
 func parseArgs(args []string) (options, error) {
 	o := options{
-		model:   defaultModel,
-		baseURL: defaultBaseURL,
+		model:           defaultModel,
+		baseURL:         defaultBaseURL,
+		promptsParallel: 1,
 	}
 
 	// 1. 配置文件 ~/.deepwebseek.json
@@ -131,10 +144,12 @@ func parseArgs(args []string) (options, error) {
 	var cli struct {
 		id                           string
 		model, baseURL, sys          string
+		prompts                      string
 		maxTokens                    int
 		reasoning                    shared.ReasoningEffort
 		webSearch                    string
 		modelSet, baseURLSet, sysSet bool
+		promptsSet                   bool
 		maxTokensSet, reasoningSet   bool
 		webSearchSet                 bool
 	}
@@ -146,6 +161,22 @@ func parseArgs(args []string) (options, error) {
 			o.jsonMode = true
 		case a == "--stream":
 			o.stream = true
+		case a == "--prompts" || strings.HasPrefix(a, "--prompts="):
+			v, err := flagValue(args, &i, a, "--prompts")
+			if err != nil {
+				return o, err
+			}
+			cli.prompts, cli.promptsSet = v, true
+		case a == "--prompts-parallel" || strings.HasPrefix(a, "--prompts-parallel="):
+			v, err := flagValue(args, &i, a, "--prompts-parallel")
+			if err != nil {
+				return o, err
+			}
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				return o, fmt.Errorf("--prompts-parallel 需要正整数，得到 %q", v)
+			}
+			o.promptsParallel = n
 		case a == "--help" || a == "-h":
 			o.showHelp = true
 		case a == "--id" || strings.HasPrefix(a, "--id="):
@@ -263,8 +294,10 @@ func parseArgs(args []string) (options, error) {
 	}
 	o.sysPrompt = sp
 
-	// 提示词优先级：有标准输入（管道）则读 stdin，否则用命令行参数。
-	if stdinIsPipe() {
+	// 提示词优先级：--prompts 文件 > 标准输入（管道） > 命令行参数。
+	if cli.promptsSet {
+		o.promptsFile = cli.prompts
+	} else if stdinIsPipe() {
 		data, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return o, fmt.Errorf("读取标准输入失败: %w", err)
@@ -426,11 +459,23 @@ func run(o options) error {
 		option.WithBaseURL(strings.TrimRight(o.baseURL, "/")), // SDK 将请求发到 {base}/responses
 	)
 
-	// 组装 Responses 请求参数。
+	// 每个输出方法都基于 options 构造自己的请求参数，避免复用同一个 params。
+	if o.promptsFile != "" {
+		return o.parallelOutput(ctx, client)
+	}
+	if o.stream {
+		return o.streamOutput(ctx, client)
+	}
+	return o.printOutput(ctx, client)
+}
+
+// newResponseParams 基于 o 当前字段和 prompt 构造一份全新的 Responses 请求参数。
+// 每次请求都应调用它，避免在并发路径中复用同一个 params。
+func (o options) newResponseParams(prompt string) responses.ResponseNewParams {
 	params := responses.ResponseNewParams{
 		Model: shared.ResponsesModel(o.model),
 		Input: responses.ResponseNewParamsInputUnion{
-			OfString: openai.String(o.prompt),
+			OfString: openai.String(prompt),
 		},
 	}
 	// 内置 web_search 工具，线上为 {"type": "web_search"}；--web-search none 时不附加。
@@ -459,15 +504,12 @@ func run(o options) error {
 	if o.reasoning != "" {
 		params.Reasoning.Effort = o.reasoning
 	}
-
-	if o.stream {
-		return o.streamOutput(ctx, client, params)
-	}
-	return o.printOutput(ctx, client, params)
+	return params
 }
 
-// streamOutput 流式输出
-func (o options) streamOutput(ctx context.Context, client openai.Client, params responses.ResponseNewParams) error {
+// streamOutput 流式输出。
+func (o options) streamOutput(ctx context.Context, client openai.Client) error {
+	params := o.newResponseParams(o.prompt)
 	stream := client.Responses.NewStreaming(ctx, params)
 	delta := ""
 	inReasoning := false // 是否正在输出思考过程
@@ -520,35 +562,133 @@ func gray(s string) string {
 	return "\x1b[90m" + s + "\x1b[0m"
 }
 
-// printOutput 非流式输出；--json 模式下先对输出做 Unmarshal/Marshal 规范化。
-func (o options) printOutput(ctx context.Context, client openai.Client, params responses.ResponseNewParams) error {
+// justGetResponse 请求 Responses 接口并返回输出文本。
+// --json 模式下会先把输出规范化为紧凑 JSON；没有输出文本时打印原始响应便于排查。
+func (o options) justGetResponse(ctx context.Context, client openai.Client, prompt string) (string, error) {
+	params := o.newResponseParams(prompt)
 	resp, err := client.Responses.New(ctx, params)
 	if err != nil {
-		return wrapAPIError(err)
+		return "", wrapAPIError(err)
 	}
 	text := resp.OutputText()
 	if strings.TrimSpace(text) == "" {
 		// 无输出文本时打印原始响应，方便排查。
 		fmt.Fprintln(os.Stderr, "deepwebseek: 响应中没有输出文本，原始响应如下：")
 		fmt.Fprintln(os.Stderr, truncate(resp.RawJSON(), 2000))
-		return nil
+		return "", nil
 	}
 	if o.jsonMode {
 		// 先 Unmarshal + Marshal 规范化为紧凑单行 JSON；失败时警告并原样输出。
 		var v any
 		if err := json.Unmarshal([]byte(text), &v); err != nil {
 			fmt.Fprintf(os.Stderr, "deepwebseek: 输出不是合法 JSON，原样打印（%v）\n", err)
-			return nil
+			return text, nil
 		}
-		if b, err := json.Marshal(v); err != nil {
+		b, err := json.Marshal(v)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "deepwebseek: JSON 序列化失败，原样打印（%v）\n", err)
-			return nil
-		} else {
-			text = string(b)
+			return text, nil
+		}
+		text = string(b)
+	}
+	return text, nil
+}
+
+// printOutput 非流式输出。
+func (o options) printOutput(ctx context.Context, client openai.Client) error {
+	text, err := o.justGetResponse(ctx, client, o.prompt)
+	if err != nil {
+		return err
+	}
+	if text != "" {
+		fmt.Println(text)
+	}
+	return nil
+}
+
+// parallelOutput 逐行读取 promptsFile 并并发发送每个提示词，并发数由 o.promptsParallel 控制。
+// 文件内容是流式读取的，不会一次性全部载入内存。
+// 每个请求完成后整体打印响应，因此 --stream 不适用于批量模式。
+func (o options) parallelOutput(ctx context.Context, client openai.Client) error {
+	promptsFile := o.promptsFile
+	f, err := os.Open(promptsFile)
+	if err != nil {
+		return fmt.Errorf("打开提示词文件 %q 失败: %w", promptsFile, err)
+	}
+	defer f.Close()
+
+	workers := o.promptsParallel
+	if workers < 1 {
+		workers = 1
+	}
+
+	type promptJob struct {
+		index  int
+		prompt string
+	}
+	jobs := make(chan promptJob)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var outputMu sync.Mutex
+	var firstErr error
+	recordErr := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		mu.Unlock()
+	}
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				// 每个提示词单独构造请求参数，避免并发复用同一个 params。
+				text, err := o.justGetResponse(ctx, client, job.prompt)
+				if err != nil {
+					recordErr(fmt.Errorf("提示词 #%d: %w", job.index+1, err))
+					continue
+				}
+				if text != "" {
+					// 保证每个响应整体输出，避免并发打印互相穿插。
+					outputMu.Lock()
+					fmt.Println(text)
+					outputMu.Unlock()
+				}
+			}
+		}()
+	}
+
+	// 边读边发送：jobs 无缓冲，读取速度会受并发请求数限制，内存占用保持稳定。
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), maxPromptLineSize)
+	count := 0
+	for scanner.Scan() {
+		line := strings.TrimSuffix(scanner.Text(), "\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		select {
+		case jobs <- promptJob{index: count, prompt: line}:
+			count++
+		case <-ctx.Done():
+			recordErr(ctx.Err())
+			close(jobs)
+			wg.Wait()
+			return firstErr
 		}
 	}
-	fmt.Println(text)
-	return nil
+	if err := scanner.Err(); err != nil {
+		recordErr(fmt.Errorf("读取提示词文件 %q 失败: %w", promptsFile, err))
+	}
+	close(jobs)
+	wg.Wait()
+
+	if count == 0 && firstErr == nil {
+		return fmt.Errorf("提示词文件 %q 中没有有效提示词", promptsFile)
+	}
+	return firstErr
 }
 
 // wrapAPIError 提取 SDK 返回的 API 错误信息（openai.Error 的 Message）。
