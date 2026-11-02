@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -50,6 +52,8 @@ const (
   --model <name>     模型名（默认 $DEEPWEBSEEK_MODEL 或 deepseek-flash）
   --base-url <url>   API 基础地址（默认 $DEEPWEBSEEK_BASE_URL 或 https://api.deepseek.com）
   --max-tokens <n>   最大输出 token 数
+  --image <path|url> 附加图片，可重复；本地文件自动转为 base64 data URL，也支持 http(s) 地址
+  --image-detail <d> 图片细节等级：low/high/auto/original（默认 auto）
   --reasoning <e>    推理强度：none/minimal/low/medium/high/xhigh/max（仅对推理模型生效）
   --web-search <m>   web_search 模式：none（不启用）/ auto（默认，模型自行决定）/ required（必须搜索）
 
@@ -65,6 +69,8 @@ const (
   deepwebseek "今天北京天气怎么样？" --stream
   deepwebseek "总结这篇文章" --sys "你是资深编辑，输出中文"
   deepwebseek "审查这段代码" --sys ./prompts/code-review.md
+  deepwebseek "这张图里有什么？" --image ./photo.jpg
+  deepwebseek "对比这两张图" --image ./a.png --image https://example.com/b.png
   deepwebseek --prompts ./prompts.txt --prompts-parallel 4
   echo "总结一下 OpenAI Responses API 与 web_search" | deepwebseek --stream
   echo '{"问题":"2+2 等于几？"}' | deepwebseek --json
@@ -93,6 +99,9 @@ type options struct {
 	baseURL         string
 	apiKey          string
 	maxTokens       int
+	images          []string               // --image：原始图片路径或 URL（可重复）
+	imageURLs       []string               // 解析后的图片 URL（本地文件为 data URL）
+	imageDetail     string                 // --image-detail：low/high/auto/original
 	sysPrompt       string                 // --sys / $DEEPWEBSEEK_SYS：内容或文件路径
 	reasoning       shared.ReasoningEffort // 推理强度：none/minimal/low/medium/high/xhigh/max
 	webSearch       string                 // --web-search：none/auto/required，空值相当于 auto
@@ -109,8 +118,8 @@ func main() {
 		fmt.Print(usage)
 		return
 	}
-	if opts.promptsFile == "" && opts.prompt == "" {
-		fmt.Fprintln(os.Stderr, "deepwebseek: 未提供提示词（通过管道传入 stdin、使用命令行参数，或使用 --prompts 指定文件）")
+	if opts.promptsFile == "" && opts.prompt == "" && len(opts.images) == 0 {
+		fmt.Fprintln(os.Stderr, "deepwebseek: 未提供提示词（通过管道传入 stdin、使用命令行参数，或使用 --prompts 指定文件；也可以仅用 --image 发送图片）")
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
@@ -132,6 +141,7 @@ func parseArgs(args []string) (options, error) {
 		model:           defaultModel,
 		baseURL:         defaultBaseURL,
 		promptsParallel: 1,
+		imageDetail:     "auto",
 	}
 
 	// 1. 配置文件 ~/.deepwebseek.json
@@ -146,12 +156,14 @@ func parseArgs(args []string) (options, error) {
 		model, baseURL, sys          string
 		prompts                      string
 		maxTokens                    int
+		images                       []string
+		imageDetail                  string
 		reasoning                    shared.ReasoningEffort
 		webSearch                    string
 		modelSet, baseURLSet, sysSet bool
 		promptsSet                   bool
 		maxTokensSet, reasoningSet   bool
-		webSearchSet                 bool
+		imageDetailSet, webSearchSet bool
 	}
 	var promptWords []string
 	for i := 0; i < len(args); i++ {
@@ -213,6 +225,22 @@ func parseArgs(args []string) (options, error) {
 				return o, fmt.Errorf("--max-tokens 需要整数，得到 %q", v)
 			}
 			cli.maxTokens, cli.maxTokensSet = n, true
+		case a == "--image" || strings.HasPrefix(a, "--image="):
+			v, err := flagValue(args, &i, a, "--image")
+			if err != nil {
+				return o, err
+			}
+			cli.images = append(cli.images, v)
+		case a == "--image-detail" || strings.HasPrefix(a, "--image-detail="):
+			v, err := flagValue(args, &i, a, "--image-detail")
+			if err != nil {
+				return o, err
+			}
+			cli.imageDetail, err = parseImageDetail(v)
+			if err != nil {
+				return o, err
+			}
+			cli.imageDetailSet = true
 		case a == "--reasoning" || strings.HasPrefix(a, "--reasoning="):
 			v, err := flagValue(args, &i, a, "--reasoning")
 			if err != nil {
@@ -283,8 +311,21 @@ func parseArgs(args []string) (options, error) {
 	if cli.reasoningSet {
 		o.reasoning = cli.reasoning
 	}
+	if cli.imageDetailSet {
+		o.imageDetail = cli.imageDetail
+	}
 	if cli.webSearchSet {
 		o.webSearch = cli.webSearch
+	}
+
+	// 图片：本地文件转为 base64 data URL，远程 URL / data URL 原样使用。
+	for _, img := range cli.images {
+		u, err := resolveImageURL(img)
+		if err != nil {
+			return o, err
+		}
+		o.images = append(o.images, img)
+		o.imageURLs = append(o.imageURLs, u)
 	}
 
 	// system prompt：若 --sys / $DEEPWEBSEEK_SYS 指向存在的文件则读取其内容，否则视为字面内容。
@@ -407,6 +448,54 @@ func parseWebSearchMode(s string) (string, error) {
 	}
 }
 
+// parseImageDetail 解析 --image-detail 的图片细节等级取值（大小写不敏感）。
+func parseImageDetail(s string) (string, error) {
+	switch strings.ToLower(s) {
+	case "low", "high", "auto", "original":
+		return strings.ToLower(s), nil
+	default:
+		return "", fmt.Errorf("--image-detail 取值无效 %q（可选: low high auto original）", s)
+	}
+}
+
+// resolveImageURL 将 --image 的取值解析为 Responses API 可用的图片 URL：
+// http(s)/data URL 原样返回；本地文件读取后编码为 base64 data URL。
+func resolveImageURL(v string) (string, error) {
+	lower := strings.ToLower(v)
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "data:") {
+		return v, nil
+	}
+	data, err := os.ReadFile(v)
+	if err != nil {
+		return "", fmt.Errorf("读取图片 %q 失败: %w", v, err)
+	}
+	mime := http.DetectContentType(data)
+	if !strings.HasPrefix(mime, "image/") {
+		if m := imageMIMEByExt(v); m != "" {
+			mime = m
+		} else {
+			return "", fmt.Errorf("无法识别图片 %q 的格式（检测为 %s；支持 png/jpeg/gif/webp）", v, mime)
+		}
+	}
+	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
+// imageMIMEByExt 根据扩展名推断图片 MIME 类型，无法判断时返回空字符串。
+func imageMIMEByExt(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	default:
+		return ""
+	}
+}
+
 // parseReasoning 解析 --reasoning / $DEEPWEBSEEK_REASONING 的推理强度取值。
 // 大小写不敏感，返回 SDK 中的 shared.ReasoningEffort；非法取值返回错误。
 func parseReasoning(s string) (shared.ReasoningEffort, error) {
@@ -474,9 +563,27 @@ func run(o options) error {
 func (o options) newResponseParams(prompt string) responses.ResponseNewParams {
 	params := responses.ResponseNewParams{
 		Model: shared.ResponsesModel(o.model),
-		Input: responses.ResponseNewParamsInputUnion{
+	}
+	if len(o.imageURLs) == 0 {
+		params.Input = responses.ResponseNewParamsInputUnion{
 			OfString: openai.String(prompt),
-		},
+		}
+	} else {
+		// 多模态输入：一条 user 消息，包含文本（可省略）和若干图片。
+		content := make(responses.ResponseInputMessageContentListParam, 0, len(o.imageURLs)+1)
+		if prompt != "" {
+			content = append(content, responses.ResponseInputContentParamOfInputText(prompt))
+		}
+		for _, u := range o.imageURLs {
+			img := responses.ResponseInputContentParamOfInputImage(responses.ResponseInputImageDetail(o.imageDetail))
+			img.OfInputImage.ImageURL = param.NewOpt(u)
+			content = append(content, img)
+		}
+		params.Input = responses.ResponseNewParamsInputUnion{
+			OfInputItemList: responses.ResponseInputParam{
+				responses.ResponseInputItemParamOfMessage(content, responses.EasyInputMessageRoleUser),
+			},
+		}
 	}
 	// 内置 web_search 工具，线上为 {"type": "web_search"}；--web-search none 时不附加。
 	if o.webSearch != "none" {

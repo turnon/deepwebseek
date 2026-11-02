@@ -15,6 +15,7 @@ deepwebseek [选项] [提示词...]
 echo "提示词" | deepwebseek [选项]
 deepwebseek --prompts prompts.txt
 deepwebseek --prompts=/path/to/prompts.txt --prompts-parallel=4
+deepwebseek "这张图里有什么？" --image ./photo.jpg
 ```
 
 提示词优先级：
@@ -36,6 +37,8 @@ deepwebseek --prompts=/path/to/prompts.txt --prompts-parallel=4
 | `--model <name>` | 模型名，默认 `$DEEPWEBSEEK_MODEL` 或 `deepseek-flash` |
 | `--base-url <url>` | API 基础地址，默认 `$DEEPWEBSEEK_BASE_URL` 或 `https://api.deepseek.com` |
 | `--max-tokens <n>` | 最大输出 token 数 |
+| `--image <path\|url>` | 附加图片，可重复指定；本地文件自动编码为 base64 data URL，也支持 `http(s)://` 与 `data:` URL |
+| `--image-detail <d>` | 图片细节等级：`low`/`high`/`auto`/`original`，默认 `auto` |
 | `--reasoning <e>` | 推理强度：`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`（仅对推理模型生效，SDK 编码为 `reasoning.effort`） |
 | `--web-search <m>` | web_search 模式：`none`（不启用，不传 `web_search` 工具）/ `auto`（默认，模型自行决定是否搜索）/ `required`（强制搜索，`tool_choice: "required"`） |
 | `-h, --help` | 显示帮助 |
@@ -65,6 +68,26 @@ deepwebseek "审查这段代码" --sys ./prompts/code-review.md
 # 通过环境变量
 DEEPWEBSEEK_SYS="你是一个简洁的助手" deepwebseek "什么是 Responses API？"
 ```
+
+### 图片输入
+
+`--image` 可重复使用，本地图片会读取并转为 base64 data URL；也可以直接传入 `http(s)://` 或 `data:` URL。支持 PNG/JPEG/GIF/WebP（优先按文件内容识别，扩展名作为兜底）。
+
+```bash
+# 单张本地图片
+deepwebseek "这张图里有什么？" --image ./photo.jpg
+
+# 多张图片（本地 + 远程）
+deepwebseek "对比这两张图" --image ./a.png --image https://example.com/b.png
+
+# 只发图片，不写提示词
+deepwebseek --image ./screenshot.png
+
+# 指定细节等级
+deepwebseek "读取图中的文字" --image ./scan.png --image-detail high
+```
+
+图片会作为同一条 `user` 消息的内容（`input_text` + `input_image`）随请求发送。使用 `--prompts` 批量模式时，同一组图片会附加到每一行提示词。
 
 ## 配置文件
 
